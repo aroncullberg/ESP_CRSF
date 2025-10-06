@@ -33,11 +33,13 @@ uint8_t crc8(const uint8_t *data, uint8_t len) {
 
 
 SemaphoreHandle_t xMutex;
+static TaskHandle_t rx_task_handle = NULL;
 
 static int uart_num = 1;
 static QueueHandle_t uart_queue;
 crsf_channels_t received_channels = {0};
 crsf_battery_t received_battery = {0};
+static bool crsf_initialized = false;
 
 
 static void rx_task(void *arg)
@@ -49,7 +51,7 @@ static void rx_task(void *arg)
         if (xQueueReceive(uart_queue, (void *)&event, (TickType_t)portMAX_DELAY)) {
             bzero(dtmp, RX_BUF_SIZE);
             if (event.type == UART_DATA ) {
-                //ESP_LOGI(TAG, "[UART DATA]: %d", event.size);
+                // ESP_LOGI(TAG, "[UART DATA]: %d", event.size);
                 uart_read_bytes(uart_num, dtmp, event.size, portMAX_DELAY);
 
                 //extract length and type
@@ -66,11 +68,11 @@ static void rx_task(void *arg)
                 }
 
                 if (type == CRSF_TYPE_CHANNELS) {
-                    
+
                     xSemaphoreTake(xMutex, portMAX_DELAY);
                     received_channels = *(crsf_channels_t*)payload;
+                    // ESP_LOGI(TAG, "%4d %4d %4d %4d %4d %4d %4d %4d %4d %4d %4d %4d %4d %4d %4d %4d", received_channels.ch1, received_channels.ch2, received_channels.ch3, received_channels.ch4, received_channels.ch5, received_channels.ch6, received_channels.ch7, received_channels.ch8, received_channels.ch9, received_channels.ch10, received_channels.ch11, received_channels.ch12, received_channels.ch13, received_channels.ch14, received_channels.ch15, received_channels.ch16);
                     xSemaphoreGive(xMutex);
-
                 }
             }
         }
@@ -80,8 +82,12 @@ static void rx_task(void *arg)
     vTaskDelete(NULL);
 }
 
-void CRSF_init(crsf_config_t *config)
+esp_err_t CRSF_init(crsf_config_t *config)
 {
+    if (crsf_initialized) {
+        ESP_LOGW(TAG, "CRSF already initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     generate_CRC(0xd5);
 
@@ -94,30 +100,85 @@ void CRSF_init(crsf_config_t *config)
         .parity = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
-        
     };
-    uart_param_config(config->uart_num, &uart_config);
-    uart_set_pin(uart_num, config->tx_pin, config->rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    // Install UART driver
+
+    ESP_ERROR_CHECK(uart_param_config(uart_num, &uart_config));
+
+    ESP_ERROR_CHECK(uart_set_pin(uart_num, config->tx_pin, config->rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+
     ESP_ERROR_CHECK(uart_driver_install(uart_num, RX_BUF_SIZE, RX_BUF_SIZE, 10, &uart_queue, 0));
 
     //create semaphore
     xMutex = xSemaphoreCreateMutex();
+    if (xMutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create mutex");
+        uart_driver_delete(uart_num);
+        return ESP_ERR_NO_MEM;
+    }
+
     //create task
-    xTaskCreate(rx_task, "uart_rx_task", 1024*4, NULL, configMAX_PRIORITIES-1, NULL);
-    
+    BaseType_t task_ret = xTaskCreate(rx_task, "uart_rx_task", 1024*4, NULL, configMAX_PRIORITIES-1, &rx_task_handle);
+    if (task_ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create RX task");
+        vSemaphoreDelete(xMutex);
+        uart_driver_delete(uart_num);
+        return ESP_ERR_NO_MEM;
+    }
+
+    crsf_initialized = true;
+    ESP_LOGI(TAG, "CRSF initialized successfully");
+    return ESP_OK;
 }
 
 //receive uart data frame
-void CRSF_receive_channels(crsf_channels_t *channels)
+esp_err_t CRSF_receive_channels(crsf_channels_t *channels)
 {
-    xSemaphoreTake(xMutex, portMAX_DELAY);
+    if (!crsf_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
     *channels = received_channels;
     xSemaphoreGive(xMutex);
+    return ESP_OK;
 }
+
+esp_err_t CRSF_cleanup(void)
+{
+    if (!crsf_initialized) {
+        ESP_LOGW(TAG, "CRSF not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "Cleaning up CRSF...");
+
+    if (rx_task_handle != NULL) {
+        vTaskDelete(rx_task_handle);
+        rx_task_handle = NULL;
+    }
+
+    if (xMutex != NULL) {
+        vSemaphoreDelete(xMutex);
+        xMutex = NULL;
+    }
+
+    ESP_ERROR_CHECK(uart_driver_delete(uart_num));
+
+    uart_queue = NULL;
+    memset(&received_channels, 0, sizeof(received_channels));
+    memset(&received_battery, 0, sizeof(received_battery));
+    crsf_initialized = false;
+
+    ESP_LOGI(TAG, "CRSF cleanup complete");
+    return ESP_OK;
+}
+
 /**
  * @brief function sends payload to a destination using uart
- * 
+ *
  * @param payload pointer to payload of given crsf_type_t
  * @param destination destination for payload, typically CRSF_DEST_FC
  * @param type type of data contained in payload
@@ -135,7 +196,7 @@ void CRSF_send_payload(const void* payload, crsf_dest_t destination, crsf_type_t
 
     //calculate crc
     unsigned char checksum = crc8(&packet[2], payload_length+1);
-    
+
     packet[payload_length+3] = checksum;
 
     //send frame
@@ -168,3 +229,95 @@ void CRSF_send_gps_data(crsf_dest_t dest, crsf_gps_t* payload)
     CRSF_send_payload(payload_proc, dest, CRSF_TYPE_GPS, sizeof(crsf_gps_t));
 }
 
+void CRSF_send_airspeed_data(crsf_dest_t dest, crsf_airspeed_t* payload)
+{
+    crsf_airspeed_t* payload_proc = 0;
+    //processed payload
+    payload_proc = (crsf_airspeed_t*)payload;
+    payload_proc->speed = __bswap16(payload_proc->speed);
+
+    CRSF_send_payload(payload_proc, dest, CRSF_TYPE_AIRSPEED, sizeof(crsf_airspeed_t));
+}
+
+void CRSF_send_flight_mode_data(crsf_dest_t dest, const char* mode_string)
+{
+    // Flight mode is a null-terminated string, no byte swapping needed, see crsf telem spec.
+    // Calculate length including null terminator
+    uint8_t len = 0;
+    while (mode_string[len] != '\0' && len < 32) {
+        len++;
+    }
+    len++; // Include null terminator
+
+    CRSF_send_payload(mode_string, dest, CRSF_TYPE_FLIGHT_MODE, len);
+}
+
+void CRSF_send_attitude_data(crsf_dest_t dest, crsf_attitude_t* payload)
+{
+    crsf_attitude_t* payload_proc = 0;
+    //processed payload
+    payload_proc = (crsf_attitude_t*)payload;
+    payload_proc->pitch = __bswap16(payload_proc->pitch);
+    payload_proc->roll = __bswap16(payload_proc->roll);
+    payload_proc->yaw = __bswap16(payload_proc->yaw);
+
+    CRSF_send_payload(payload_proc, dest, CRSF_TYPE_ATTITUDE, sizeof(crsf_attitude_t));
+}
+
+void CRSF_send_temp_data(crsf_dest_t dest, uint8_t source_id, const int16_t* temps, uint8_t count)
+{
+    // Limit to max 20 temperatures
+    if (count > 20) {
+        count = 20;
+    }
+
+    // Build payload: source_id + temperature array
+    uint8_t payload_size = 1 + (count * 2); // 1 byte for source_id + 2 bytes per temperature
+    uint8_t payload[payload_size];
+
+    payload[0] = source_id;
+
+    // Copy temperatures with byte swapping
+    for (uint8_t i = 0; i < count; i++) {
+        int16_t temp_swapped = __bswap16(temps[i]);
+        memcpy(&payload[1 + (i * 2)], &temp_swapped, 2);
+    }
+
+    CRSF_send_payload(payload, dest, CRSF_TYPE_TEMP, payload_size);
+}
+
+/**
+ * @brief Pack a signed 32-bit integer into 24-bit big-endian format
+ *
+ * @param dest destination buffer (must have 3 bytes available)
+ * @param value signed 32-bit value to pack
+ */
+static void pack_int24_be(uint8_t* dest, int32_t value)
+{
+    // Pack as big-endian 24-bit signed integer
+    // MSB first, LSB last
+    dest[0] = (value >> 16) & 0xFF;
+    dest[1] = (value >> 8) & 0xFF;
+    dest[2] = value & 0xFF;
+}
+
+void CRSF_send_rpm_data(crsf_dest_t dest, uint8_t source_id, const int32_t* rpms, uint8_t count)
+{
+    // Limit to max 19 RPM values
+    if (count > 19) {
+        count = 19;
+    }
+
+    // Build payload: source_id + RPM array (3 bytes per RPM)
+    uint8_t payload_size = 1 + (count * 3); // 1 byte for source_id + 3 bytes per RPM
+    uint8_t payload[payload_size];
+
+    payload[0] = source_id;
+
+    // Pack each RPM as 24-bit big-endian
+    for (uint8_t i = 0; i < count; i++) {
+        pack_int24_be(&payload[1 + (i * 3)], rpms[i]);
+    }
+
+    CRSF_send_payload(payload, dest, CRSF_TYPE_RPM, payload_size);
+}
