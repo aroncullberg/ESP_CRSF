@@ -39,46 +39,97 @@ static int uart_num = 1;
 static QueueHandle_t uart_queue;
 crsf_channels_t received_channels = {0};
 crsf_battery_t received_battery = {0};
+static uint32_t last_channel_update_ms = 0;
 static bool crsf_initialized = false;
 
 
 static void rx_task(void *arg)
 {
     uart_event_t event;
-    uint8_t* dtmp = (uint8_t*) malloc(RX_BUF_SIZE);
+    uint8_t* uart_buf = (uint8_t*) malloc(RX_BUF_SIZE);
+    uint8_t frame_buf[CRSF_MAX_FRAME_SIZE];
+    size_t frame_pos = 0;
+    bool synced = false;
+
+    ESP_LOGI(TAG, "CRSF RX task started");
+
     for (;;) {
         //Waiting for UART event.
         if (xQueueReceive(uart_queue, (void *)&event, (TickType_t)portMAX_DELAY)) {
-            bzero(dtmp, RX_BUF_SIZE);
-            if (event.type == UART_DATA ) {
-                // ESP_LOGI(TAG, "[UART DATA]: %d", event.size);
-                uart_read_bytes(uart_num, dtmp, event.size, portMAX_DELAY);
-
-                //extract length and type
-                uint8_t type = dtmp[2];
-                uint8_t length = dtmp[1];
-                uint8_t dest = dtmp[0];
-
-                //read the rest of the frame
-                uint8_t payload_length = length - 2;
-                uint8_t payload[payload_length];
-
-                for (int i = 0; i < payload_length; i++) {
-                    payload[i] = dtmp[i+3];
+            if (event.type == UART_DATA) {
+                int len = uart_read_bytes(uart_num, uart_buf, event.size, portMAX_DELAY);
+                if (len <= 0) {
+                    continue;
                 }
 
-                if (type == CRSF_TYPE_CHANNELS) {
+                for (int i = 0; i < len; i++) {
+                    uint8_t byte = uart_buf[i];
 
-                    xSemaphoreTake(xMutex, portMAX_DELAY);
-                    received_channels = *(crsf_channels_t*)payload;
-                    // ESP_LOGI(TAG, "%4d %4d %4d %4d %4d %4d %4d %4d %4d %4d %4d %4d %4d %4d %4d %4d", received_channels.ch1, received_channels.ch2, received_channels.ch3, received_channels.ch4, received_channels.ch5, received_channels.ch6, received_channels.ch7, received_channels.ch8, received_channels.ch9, received_channels.ch10, received_channels.ch11, received_channels.ch12, received_channels.ch13, received_channels.ch14, received_channels.ch15, received_channels.ch16);
-                    xSemaphoreGive(xMutex);
+                    if (!synced) {
+                        // Looking for SYNC byte
+                        if (byte == CRSF_SYNC_BYTE) {
+                            frame_buf[0] = byte;
+                            frame_pos = 1;
+                            synced = true;
+                        }
+                    } else {
+                        frame_buf[frame_pos++] = byte;
+
+                        if (frame_pos >= 2) {
+                            uint8_t frame_length = frame_buf[CRSF_FRAME_SIZE_OFFSET];
+                            uint8_t total_frame_size = frame_length + 2; // +2 for SYNC and LENGTH bytes
+
+                            if (frame_length < 2 || total_frame_size > CRSF_MAX_FRAME_SIZE) {
+                                ESP_LOGW(TAG, "Invalid frame length: %d", frame_length);
+                                synced = false;
+                                frame_pos = 0;
+                                continue;
+                            }
+
+                            if (frame_pos >= total_frame_size) {
+                                // Extract frame components
+                                uint8_t type = frame_buf[CRSF_PAYLOAD_OFFSET];
+                                uint8_t* payload = &frame_buf[CRSF_PAYLOAD_OFFSET + 1];
+                                uint8_t payload_length = frame_length - 2; // -2 for TYPE and CRC
+                                uint8_t received_crc = frame_buf[total_frame_size - 1];
+
+                                uint8_t calculated_crc = crc8(&frame_buf[CRSF_PAYLOAD_OFFSET], frame_length - 1);
+
+                                if (received_crc == calculated_crc) {
+                                    if (type == CRSF_TYPE_CHANNELS && payload_length == sizeof(crsf_channels_t)) {
+                                        xSemaphoreTake(xMutex, portMAX_DELAY);
+                                        memcpy(&received_channels, payload, sizeof(crsf_channels_t));
+                                        last_channel_update_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                                        xSemaphoreGive(xMutex);
+
+                                        // ESP_LOGD(TAG, "Valid channels: ch1=%d ch2=%d ch3=%d ch4=%d",
+                                        //          received_channels.ch1, received_channels.ch2,
+                                        //          received_channels.ch3, received_channels.ch4);
+                                    }
+                                } else {
+                                    ESP_LOGW(TAG, "CRC mismatch: got 0x%02X, expected 0x%02X (type=0x%02X, len=%d)",
+                                             received_crc, calculated_crc, type, frame_length);
+                                }
+
+                                // Reset for next frame
+                                synced = false;
+                                frame_pos = 0;
+                            }
+                        }
+
+                        if (frame_pos >= CRSF_MAX_FRAME_SIZE) {
+                            ESP_LOGW(TAG, "Frame buffer overflow, resetting");
+                            synced = false;
+                            frame_pos = 0;
+                        }
+                    }
                 }
             }
         }
     }
-    free(dtmp);
-    dtmp = NULL;
+
+    free(uart_buf);
+    uart_buf = NULL;
     vTaskDelete(NULL);
 }
 
@@ -141,9 +192,50 @@ esp_err_t CRSF_receive_channels(crsf_channels_t *channels)
         return ESP_ERR_TIMEOUT;
     }
 
+    uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    uint32_t age_ms = now_ms - last_channel_update_ms;
+
+    if (age_ms > CRSF_FAILSAFE_TIMEOUT_MS || last_channel_update_ms == 0) {
+        xSemaphoreGive(xMutex);
+        return ESP_ERR_TIMEOUT;
+    }
+
     *channels = received_channels;
     xSemaphoreGive(xMutex);
     return ESP_OK;
+}
+
+esp_err_t CRSF_get_last_channel_update(uint32_t *timestamp_ms)
+{
+    if (!crsf_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    *timestamp_ms = last_channel_update_ms;
+    xSemaphoreGive(xMutex);
+    return ESP_OK;
+}
+
+bool CRSF_is_link_active(uint32_t timeout_ms)
+{
+    if (!crsf_initialized) {
+        return false;
+    }
+
+    if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+        return false;
+    }
+
+    uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    uint32_t age_ms = now_ms - last_channel_update_ms;
+    bool active = (age_ms <= timeout_ms) && (last_channel_update_ms != 0);
+
+    xSemaphoreGive(xMutex);
+    return active;
 }
 
 esp_err_t CRSF_cleanup(void)
@@ -170,6 +262,7 @@ esp_err_t CRSF_cleanup(void)
     uart_queue = NULL;
     memset(&received_channels, 0, sizeof(received_channels));
     memset(&received_battery, 0, sizeof(received_battery));
+    last_channel_update_ms = 0;
     crsf_initialized = false;
 
     ESP_LOGI(TAG, "CRSF cleanup complete");

@@ -1,4 +1,5 @@
 #include "stdio.h"
+#include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/uart.h"
@@ -14,6 +15,12 @@
 
 
 #define TAG "CRSF"
+
+#define CRSF_SYNC_BYTE 0xC8        // https://px4.github.io/Firmware-Doxygen/d9/dd2/crsf_8cpp.html#a4d058fcf8a89efac4c05336f14eb17d9
+#define CRSF_MAX_FRAME_SIZE 64
+#define CRSF_FRAME_SIZE_OFFSET 1
+#define CRSF_PAYLOAD_OFFSET 2
+#define CRSF_FAILSAFE_TIMEOUT_MS 100
 
 /**
  * @brief struct to hold the configuration of the CRSF
@@ -179,10 +186,29 @@ esp_err_t CRSF_cleanup(void);
 /**
  * @brief copy latest 16 channel data received to the pointer
  *
+ * This function checks if the data is fresh (received within CRSF_FAILSAFE_TIMEOUT_MS).
+ * If data is stale, it returns ESP_ERR_TIMEOUT to indicate link loss.
+ *
  * @param channels pointer to receiver buffer
- * @return esp_err_t ESP_OK if successful, ESP_FAIL if no data available
+ * @return esp_err_t ESP_OK if data is fresh, ESP_ERR_TIMEOUT if link lost, ESP_ERR_INVALID_STATE if not initialized
  */
 esp_err_t CRSF_receive_channels(crsf_channels_t *channels);
+
+/**
+ * @brief Get the timestamp of the last valid channel packet received
+ *
+ * @param timestamp_ms pointer to store the timestamp (in milliseconds)
+ * @return esp_err_t ESP_OK if successful, ESP_ERR_INVALID_STATE if not initialized
+ */
+esp_err_t CRSF_get_last_channel_update(uint32_t *timestamp_ms);
+
+/**
+ * @brief Check if the CRSF link is currently active
+ *
+ * @param timeout_ms maximum age of last packet to consider link active (recommended: 250-500ms)
+ * @return true if a valid packet was received within timeout_ms, false otherwise
+ */
+bool CRSF_is_link_active(uint32_t timeout_ms);
 
 /**
  * @brief send battery data telemetry
