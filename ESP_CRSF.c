@@ -414,3 +414,20 @@ void CRSF_send_rpm_data(crsf_dest_t dest, uint8_t source_id, const int32_t* rpms
 
     CRSF_send_payload(payload, dest, CRSF_TYPE_RPM, payload_size);
 }
+
+void CRSF_send_accelgyro_data(crsf_dest_t dest, crsf_accelgyro_t* payload)
+{
+    crsf_accelgyro_t* payload_proc = 0;
+    //processed payload
+    payload_proc = (crsf_accelgyro_t*)payload;
+    payload_proc->pitch = __bswap16(payload_proc->sample_time);
+    payload_proc->roll = __bswap16(payload_proc->gyro_x);
+    payload_proc->yaw = __bswap16(payload_proc->gyro_y);
+    payload_proc->yaw = __bswap16(payload_proc->gyro_z);
+    payload_proc->yaw = __bswap16(payload_proc->acc_x);
+    payload_proc->yaw = __bswap16(payload_proc->acc_y);
+    payload_proc->yaw = __bswap16(payload_proc->acc_z);
+    payload_proc->yaw = __bswap16(payload_proc->gyro_temp);
+
+    CRSF_send_payload(payload_proc, dest, CRSF_TYPE_ACCELGYRO, sizeof(crsf_accelgyro_t));
+}

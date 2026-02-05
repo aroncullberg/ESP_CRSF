@@ -150,18 +150,33 @@ typedef struct __attribute__((packed))
     // int24_t rpm_value[];    // Variable length array (1-19 values, 3 bytes each)
 } crsf_rpm_header_t;
 
+// TODO: Make comments that adhere to coding style of the rest of the component
+typedef struct __attribute__((packed))
+{
+    uint32_t sample_time;       // Timestamp of the sample in us
+    int16_t gyro_x;             // LSB = INT16_MAX/2000 DPS
+    int16_t gyro_y;             // LSB = INT16_MAX/2000 DPS
+    int16_t gyro_z;             // LSB = INT16_MAX/2000 DPS
+    int16_t acc_x;              // LSB = INT16_MAX/16 G
+    int16_t acc_y;              // LSB = INT16_MAX/16 G
+    int16_t acc_z;              // LSB = INT16_MAX/16 G
+    int16_t gyro_temp;          // centidegrees
+} crsf_accelgyro_t;
+
 
 typedef enum
 {
     CRSF_TYPE_CHANNELS = 0x16,
     CRSF_TYPE_BATTERY = 0x08,
     CRSF_TYPE_GPS = 0x02,
+    CRSF_TYPE_GPS_TIME = 0x03, // TODO: not implemented
     CRSF_TYPE_ALTITUDE = 0x09,
     CRSF_TYPE_AIRSPEED = 0x0A,
     CRSF_TYPE_RPM = 0x0C,
     CRSF_TYPE_TEMP = 0x0D,
-    CRSF_TYPE_ATTITUDE = 0x1E,
+    CRSF_TYPE_ATTITUDE = 0x1E, // NOTE: This is quaternion
     CRSF_TYPE_FLIGHT_MODE = 0x21,
+    CRSF_TYPE_ACCELGYRO = 0x13, // TODO: not implemented
 } crsf_type_t;
 
 typedef enum
@@ -270,3 +285,5 @@ void CRSF_send_temp_data(crsf_dest_t dest, uint8_t source_id, const int16_t* tem
  */
 void CRSF_send_rpm_data(crsf_dest_t dest, uint8_t source_id, const int32_t* rpms, uint8_t count);
 
+// TODO: Make comment like rest of code
+void CRSF_send_accelgyro_data(crsf_dest_t dest, crsf_accelgyro_t* payload);
